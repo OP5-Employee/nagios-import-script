@@ -1,284 +1,1019 @@
-#!/usr/bin/env python2.6
+#!/usr/bin/env python
 
-# Standard Lib Modules
 import os
 import logging
 import argparse
-import fnmatch
+import ConfigParser
+import ast
 import re
+import json
+import hashlib
+from pprint import pprint
+from time import sleep
+
+import requests
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 
-def reset_content_block():
-    return {"type": 'unknown', "content": {}}
+class OP5MonitorHTTP:
+    params = {'format': 'json'}
+    header = {'content-type': 'application/json'}
+    ssl_check = True
+    nop = False
+    pop = False
+    save_check = 0
+
+    def __init__(self, server_url, account, password, save_interval):
+        #self.__class__.logger = logging.getLogger(self.class.__class__.__name__)
+        self.url = "/".join(
+            [
+                server_url,
+                "api",
+                "config"
+            ]
+        )
+        self.auth_pair = (account, password)
+        self.save_interval = save_interval
+
+    def disable_ssl(self):
+        print("Supressing SSL warnings...")
+        self.ssl_check = False
+        requests.packages.urllib3.disable_warnings()
+
+    def set_no_op(self):
+        self.nop = True
+
+        if self.pop:
+            self.pop = False
+
+    def set_part_op(self):
+        self.pop = True
+
+        if self.nop:
+            self.nop = False
+
+    def print_error(self, status_code, http_text, content):
+        error_text = ast.literal_eval(http_text)
+        print("Status code: {0}\tError: {1}".format(
+            status_code,
+            error_text["full_error"]
+        ))
+        pprint(content)
+
+    def build_target(self, endpoint, endpoint_obj=''):
+        return "/".join([self.url, endpoint, endpoint_obj])
+
+    def check_save_interval(self):
+        if self.save_check < self.save_interval:
+            self.save_check += 1
+        elif self.save_check > 0:
+            self.save()
+
+    def check_status_code(self, http_obj, datapayload={}):
+        if http_obj.status_code != 200 \
+           and http_obj.status_code != 201:
+            self.print_error(http_obj.status_code,
+                             http_obj.text, datapayload)
+
+    def save(self):
+        self.save_check = 0
+
+        server_target = self.build_target("change")
+
+        http_save = requests.get(
+            server_target,
+            verify=self.ssl_check,
+            auth=self.auth_pair,
+            params=self.params
+        )
+
+        if json.loads(http_save.text) == []:
+            print("Save queue empty. Nothing to do.")
+        else:
+            http_save = requests.post(
+                server_target,
+                verify=self.ssl_check,
+                auth=self.auth_pair,
+                params=self.params,
+                headers=self.header,
+                data=json.dumps({})
+            )
+
+            sleep(3)
 
 
-def parse_file(file_obj, regex):
-    print("Parsing file.")
+        if http_save.status_code != 200 \
+           and http_save.status_code != 201:
+            self.print_error(http_save.status_code,
+                             http_save.text,
+                             "Save function, no data.")
+
+        return http_save.status_code
+
+    def patch(self, endpoint, endpoint_obj, datalist):
+        if self.nop:
+            print("No op specified. Not patching.")
+            return 0
+
+        print("Patching object...")
+        for datapayload in datalist:
+            server_target = self.build_target(endpoint, endpoint_obj)
+            http_patch = requests.patch(
+                server_target,
+                verify=self.ssl_check,
+                auth=self.auth_pair,
+                params=self.params,
+                headers=self.header,
+                data=json.dumps(datapayload["content"])
+            )
+
+            self.check_status_code(http_patch, datapayload)
+            self.check_save_interval()
+
+        self.check_save_interval()
+
+        return http_patch.status_code
+
+    def put(self, endpoint, endpoint_obj, datalist):
+        if self.nop:
+            print("No op specified. Not overwriting.")
+            return 0
+
+        print ("Putting object and overwriting...")
+        server_target = self.build_target(endpoint, endpoint_obj)
+
+        for datapayload in datalist:
+            http_put = requests.put(
+                server_target,
+                verify=self.ssl_check,
+                auth=self.auth_pair,
+                params=self.params,
+                headers=self.header,
+                data=json.dumps(datapayload["content"])
+            )
+
+            self.check_status_code(http_put, datapayload)
+            self.check_save_interval()
+
+        return http_put.status_code
+
+    def post(self, endpoint, datalist, update_on_duplicate=False):
+        if self.nop:
+            print("No op specified. Not posting.")
+            return 0
+
+        print("Posting object...")
+        server_target = self.build_target(endpoint)
+
+        for datapayload in datalist:
+            http_post = requests.post(
+                server_target,
+                verify=self.ssl_check,
+                auth=self.auth_pair,
+                params=self.params,
+                headers=self.header,
+                data=json.dumps(datapayload["content"])
+            )
+
+            if http_post.status_code == 409 \
+               and update_on_duplicate == True:
+                self.put(endpoint, datapayload["block_name"], [datapayload])
+            elif http_post.status_code == 409:
+                print("409 code")
+            else:
+                self.check_status_code(http_post, datapayload)
+
+            self.check_save_interval()
+
+        self.save()
+
+        return http_post.status_code
+
+    def get(self, endpoint):
+        if self.nop:
+            print("No op specified. Not getting endpoint.")
+            return 0
+
+        print("Getting object...")
+        server_target = self.build_target(endpoint)
+        http_get = requests.get(
+            server_target,
+            verify=self.ssl_check,
+            auth=self.auth_pair,
+            params=self.params,
+            headers=self.header,
+        )
+
+        self.check_status_code(http_get)
+
+        return (http_get.status_code, json.loads(http_get.text))
+
+
+class ConfigFileObj:
+    logger = logging.getLogger(__name__)
+    common = {
+        "script": None,
+        "comment": None,
+        "blankline": None,
+        "block_start": None,
+        "block_end": None
+    }
+    block = dict()
+    field = dict()
+    replacements = dict()
+    override_file = None
+
+    def __init__(self, config):
+        self.override_file = re.compile(
+            ast.literal_eval(
+                config.get("include", "override_file")
+            )
+        )
+        self.common["script"] = re.compile(
+            ast.literal_eval(
+                config.get("cfgfile_common", "script")
+            )
+        )
+        self.common["comment"] = re.compile(
+            ast.literal_eval(
+                config.get("cfgfile_common", "comment")
+            )
+        )
+        self.common["blankline"] = re.compile(
+            ast.literal_eval(
+                config.get("cfgfile_common", "blankline")
+            )
+        )
+        self.common["block_start"] = re.compile(
+            ast.literal_eval(
+                config.get("cfgfile_common", "block_start")
+            )
+        )
+        self.common["block_end"] = re.compile(
+            ast.literal_eval(
+                config.get("cfgfile_common", "block_end")
+            )
+        )
+
+        for cfgpair in config.items("cfgfile_block_type"):
+            self.block[cfgpair[0]] = re.compile(
+                ast.literal_eval(
+                    cfgpair[1]
+                )
+            )
+
+        for cfgpair in config.items("block_field"):
+            self.field[cfgpair[0]] = re.compile(
+                ast.literal_eval(
+                    cfgpair[1]
+                )
+            )
+
+        search_type = "common"
+        self.replacements[search_type] = dict()
+        for cfgpair in config.items("cfgfile_replacements_common"):
+            self.replacements[search_type][cfgpair[0]] = re.compile(
+                ast.literal_eval(cfgpair[1])
+            )
+
+        search_type = "timeperiod"
+        self.replacements[search_type] = dict()
+        for cfgpair in config.items("cfgfile_replacements_timeperiod"):
+            self.replacements[search_type][cfgpair[0]] = re.compile(
+                ast.literal_eval(cfgpair[1])
+            )
+
+        search_type = "host"
+        self.replacements[search_type] = dict()
+        for cfgpair in config.items("cfgfile_replacements_host_template"):
+            self.replacements[search_type][cfgpair[0]] = re.compile(
+                ast.literal_eval(cfgpair[1])
+            )
+
+        search_type = "service"
+        self.replacements[search_type] = dict()
+        for cfgpair in config.items("cfgfile_replacements_service"):
+            self.replacements[search_type][cfgpair[0]] = re.compile(
+                ast.literal_eval(cfgpair[1])
+            )
+
+    def print_common(self, verbose=True):
+        logger = logging.getLogger(__name__)
+        if verbose:
+            print("Common Regex:")
+        for pair in self.common.items():
+            key, val = pair
+            if verbose:
+                print("{0}\t{1}".format(key, val.pattern))
+            logger.info("Common Regex Pattern: {0}\t{1}".format(
+                key, val.pattern
+            ))
+
+    def print_block(self, verbose=True):
+        logger = logging.getLogger(__name__)
+        if verbose:
+            print("Config Block Regex:")
+        for pair in self.block.items():
+            key, val = pair
+            if verbose:
+                print("{0}\t{1}".format(key, val.pattern))
+            logger.info("Config Block Regex Pattern: {0}\t{1}".format(
+                key, val.pattern
+            ))
+
+    def print_fields(self, verbose=True):
+        logger = logging.getLogger(__name__)
+        if verbose:
+            print("Config Field Regex:")
+        for pair in self.field.items():
+            key, val = pair
+            if verbose:
+                print("{0}\t{1}".format(key, val.pattern))
+            logger.info("Config Field Regex Pattern: {0}\t{1}".format(
+                key, val.pattern
+            ))
+
+
+class OP5DatabaseClass:
+    def __init__(self, account, password, database, host):
+        self.account = account
+        self.password = password
+        self.database = database
+        self.host = host
+
+        try:
+            print("Starting database connection...")
+            self.connection = psycopg2.connect(
+                user=account,
+                password=password,
+                host=host,
+                dbname=database,
+                cursor_factory=RealDictCursor
+            )
+        except (Exception, psycopg2.DatabaseError) as error:
+            print(error)
+
+    def __del__(self):
+        self.connection.close()
+
+    def close(self):
+        self.connection.close()
+        print("Closing database connection.")
+
+    def metadata_insert(self, entry_type, data):
+        sql_insert_statement = """
+        INSERT INTO metadata(entry_type, data)
+        VALUES(%s, %s) ON CONFLICT DO NOTHING;
+        """
+        self.cursor = self.connection.cursor()
+        self.cursor.execute(sql_insert_statement, (entry_type, data))
+        self.connection.commit()
+        self.cursor.close()
+
+    def content_insert(self, filehash, override, item):
+        sql_insert_statement = """
+        INSERT INTO content(
+                       filehash,
+                       filename,
+                       block_num,
+                       block_type,
+                       block_name,
+                       override,
+                       template,
+                       content
+                    )
+        VALUES(%s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT DO NOTHING;
+        """
+
+        cursor = self.connection.cursor()
+        cursor.execute(
+            sql_insert_statement,
+            (
+                filehash,
+                item['filename'],
+                item['block_num'],
+                item['type'],
+                item['name'],
+                override,
+                item['template'],
+                json.dumps(item['content']),
+            )
+        )
+        self.connection.commit()
+        cursor.close()
+
+    def content_fetch(self, column_names, where_clause):
+        sql_select_statement = """
+        SELECT
+            {0}
+        FROM
+            content
+        WHERE
+            {1}
+        """.format(column_names, where_clause)
+
+        cursor = self.connection.cursor()
+        cursor.execute(sql_select_statement)
+        rows = cursor.fetchall()
+        cursor.close()
+        return rows
+
+
+def regex_match(regex, string):
+    if regex.match(string):
+        return True
+    else:
+        return False
+
+
+def entry_cleaner(config_class, block_type, template, line):
+    if block_type == 'contact':
+        if config_class.replacements['common']['notification_cmds'].match(line):
+            line = line.replace('commands', 'cmds')
+        elif config_class.replacements['common']['template'].match(line):
+            line = line.replace('use', 'template')
+
+    elif block_type == 'host':
+        if config_class.replacements['host']['failure_prediction'].match(line):
+            line = None
+        elif config_class.replacements['common']['template'].match(line):
+            line = line.replace('use', 'template')
+
+    elif block_type == 'service':
+        if config_class.replacements['common']['template'].match(line):
+            line = line.replace('use', 'template')
+
+    # Breaking the line up into fields for JSON key/value pairs.
+    if line:
+        if block_type == 'timeperiod' \
+           and not config_class.replacements['timeperiod']['nottimerange'].match(line):
+            line = line.rsplit( ' ', 1)
+        else:
+            line = line.split(' ', 1)
+
+        if len(line) == 1:
+            line.append('')
+
+    return line
+
+
+def block_cleaner(block_type, parsed_block):
+    if block_type == "contact":
+        if "alias" not in parsed_block["content"] \
+           and parsed_block["template"] == False:
+            parsed_block["content"]["alias"] = \
+                                        parsed_block["content"]["contact_name"]
+
+    elif block_type == "contactgroup":
+        # TODO Change this part to a regex function.
+        # Making sure the members are a ", " separated list as the API
+        # thinks a "," separated list is a single word.
+        if "members" in parsed_block["content"] \
+           and parsed_block["template"] == False:
+            if "," in parsed_block["content"]["members"]:
+                temp_list = list()
+                for entry in parsed_block["content"]["members"].split(","):
+                    temp_list.append(entry.strip())
+                    parsed_block["content"]["members"] = temp_list
+
+        if "alias" not in parsed_block["content"] \
+           and parsed_block["template"] == False:
+            parsed_block["content"]["alias"] = \
+                                parsed_block["content"]["contactgroup_name"]
+
+    elif block_type == "host":
+        if "contact_groups" in parsed_block["content"]:
+            parsed_block["content"]["contact_groups"] = \
+                        parsed_block["content"]["contact_groups"].split(",")
+
+        if "hostgroups" in parsed_block["content"]:
+            parsed_block["content"]["hostgroups"] = \
+                            parsed_block["content"]["hostgroups"].split(",")
+
+    elif block_type == "hostgroup":
+        if "members" in parsed_block["content"]:
+            parsed_block["content"]["members"] = \
+                               parsed_block["content"]["members"].split(',')
+
+        if "hostgroup_name" not in parsed_block["content"] \
+           and "alias" in parsed_block["content"]:
+            parsed_block["content"]["hostgroup_name"] = \
+                  parsed_block["content"]["alias"].lower().replace(" ", "-")
+
+    elif block_type == "service":
+        if "contact_groups" in parsed_block["content"]:
+            parsed_block["content"]["contact_groups"] = \
+                        parsed_block["content"]["contact_groups"].split(",")
+
+        if parsed_block["template"] == False \
+           and "service_description" in parsed_block["content"] \
+           and "name" in parsed_block["content"]:
+            parsed_block["content"]["display_name"] = \
+                          parsed_block["content"].pop("service_description")
+            parsed_block["content"]["service_description"] = \
+                                         parsed_block["content"].pop("name")
+        elif "name" in parsed_block["content"] \
+             and "service_description" not in parsed_block["content"] \
+             and parsed_block["template"] == False:
+            parsed_block["content"]["service_description"] = \
+                                         parsed_block["content"].pop("name")
+
+        if "service_description" not in parsed_block["content"] \
+           and parsed_block["template"] == False:
+            parsed_block["content"]["service_description"] = \
+                                        parsed_block["content"]["host_name"]
+
+        if parsed_block["template"] == True \
+           and "service_description" in parsed_block["content"]:
+            parsed_block["content"]["display_name"] = \
+                          parsed_block["content"].pop("service_description")
+
+        if "check_command" in parsed_block["content"] \
+           and '!' in parsed_block["content"]["check_command"]:
+            parsed_block["content"]["check_command"], \
+                parsed_block["content"]["check_command_args"] = \
+                parsed_block["content"]["check_command"].split("!", 1)
+
+    elif block_type == "hostescalation":
+        if "contact_groups" in parsed_block["content"] \
+           and parsed_block["template"] == False:
+            parsed_block["content"]["contact_groups"] = \
+                        parsed_block["content"]["contact_groups"].split(',')
+
+    elif block_type == "serviceescalation":
+        if "contact_groups" in parsed_block["content"] \
+           and parsed_block["template"] == False:
+            parsed_block["content"]["contact_groups"] = \
+                        parsed_block["content"]["contact_groups"].split(",")
+
+    return parsed_block
+
+def parse_file(file_obj, config_class, verbose=False):
+    logger = logging.getLogger(__name__)
+    in_block = False
+    return_list = list()
     parsed_file = dict()
     block_num = 0
-    in_block = False
-    content_block = reset_content_block()
+    block_type = None
+
+    command_line_regex = re.compile("^command_line\s")
 
     for line in file_obj:
+        line = line.strip()
         # Yes, lines could be tab separated. :(
-        line = line.strip().replace('\t', ' ')
+        line = line.replace('\t', ' ')
+        # Stripping out comments, because Monitor acts like they are part of
+        # the name.
+        if not command_line_regex.match(line):
+            # TODO: Move this to regex capture groups.
+            line = line.split(';', 1).pop(0).strip()
 
-        if regex["comment"].match(line) or regex["blankline"].match(line):
+        if verbose:
+            print("File line: {0}".format(line))
+        if config_class.common['comment'].match(line) \
+           or config_class.common['blankline'].match(line) \
+           or config_class.common['script'].match(line):
             continue
 
         if not in_block:
-            if regex["host"].match(line):
-                print("Host match. {0}".format(file_obj.name))
-                content_block["type"] = "host"
+            if config_class.common["block_start"].match(line):
                 in_block = True
-            elif regex["hostgroup"].match(line):
-                print("Hostgroup match. {0}".format(file_obj.name))
-                content_block["type"] = "hostgroup"
-                in_block = True
-            elif regex["hostdependency"].match(line):
-                print("hostdependency match. {0}".format(file_obj.name))
-                content_block["type"] = "hostdependency"
-                in_block = True
-            elif regex["hostescalation"].match(line):
-                print("hostescalation match. {0}".format(file_obj.name))
-                content_block["type"] = "hostescalation"
-                in_block = True
-            elif regex["hostextinfo"].match(line):
-                print("hostextinfo match. {0}".format(file_obj.name))
-                content_block["type"] = "hostextinfo"
-                in_block = True
-            elif regex["service"].match(line):
-                print("Service match. {0}".format(file_obj.name))
-                content_block["type"] = "service"
-                in_block = True
-            elif regex["servicegroup"].match(line):
-                print("Servicegroup match. {0}".format(file_obj.name))
-                content_block["type"] = "servicegroup"
-                in_block = True
-            elif regex["servicedependency"].match(line):
-                print("servicedependency match. {0}".format(file_obj.name))
-                content_block["type"] = "servicedependency"
-                in_block = True
-            elif regex["serviceescalation"].match(line):
-                print("serviceescalation match. {0}".format(file_obj.name))
-                content_block["type"] = "serviceescalation"
-                in_block = True
-            elif regex["serviceextinfo"].match(line):
-                print("serviceextinfo match. {0}".format(file_obj.name))
-                content_block["type"] = "serviceextinfo"
-                in_block = True
-            elif regex["contact"].match(line):
-                print("contact match. {0}".format(file_obj.name))
-                content_block["type"] = "contact"
-                in_block = True
-            elif regex["contactgroup"].match(line):
-                print("contactgroup match. {0}".format(file_obj.name))
-                content_block["type"] = "contactgroup"
-                in_block = True
-            elif regex["timeperiod"].match(line):
-                print("timeperiod match. {0}".format(file_obj.name))
-                content_block["type"] = "timeperiod"
-                in_block = True
-            elif regex["command"].match(line):
-                print("command match. {0}".format(file_obj.name))
-                content_block["type"] = "command"
-                in_block = True
-        elif in_block:
-            if regex["end"].match(line):  # This is for files with multiple blocks.
-                print("End of block.")
-                # Added content_block to parsed_file
-                parsed_file[block_num] = content_block
-                block_num += 1
-                in_block = False
-                content_block = reset_content_block()
-            else:
-                line = line.split(' ', 1)
-                print("Line: {0}".format(line))
-                if len(line) == 1:
-                    line.append('')
-                content_block["content"][line[0]] = line[1].strip()
 
-    return parsed_file
+                parsed_file["filename"] = file_obj.name
+                parsed_file["block_num"] = block_num
+                parsed_file["type"] = ''
+                parsed_file["name"] = ''
+                parsed_file["template"] = False
+                parsed_file["content"] = dict()
 
-
-def merge_files(file1, file2):
-    print("Merging files.")
-    print("Parsed File 1: {0}".format(file1))
-    print("Parsed File 2: {0}".format(file2))
-    for block in file2:
-        if block in file1:
-            # Making the assumption the types are the same.
-            for key in file2[block]["content"]:
-                if key in file1[block]["content"]:
-                    if file1[block]["content"][key] != file2[block]["content"][key]:
-                        file1[block]["content"][key] = file2[block]["content"][key]
-                    else:
-                        file1[block]["content"][key] = file1[block]["content"][key]
-                else:
-                    file1[block]["content"][key] = file2[block]["content"][key]
+                for key in config_class.block.keys():
+                    if config_class.block[key].match(line):
+                        parsed_file["type"] = key
+                        block_type = key
+                        # Exiting for loop once we get a match because a block
+                        # will only match once
+                        break
         else:
-            file1[block] = file2[block]
-
-    print("Merged Files: {0}".format(file1))
-
-    return file1
-
-
-def set_dict_block(file_dict, file_name, block_type, block_num, block):
-    key = "{0}::{1}_block:{2}".format(file_name, block_type, block_num)
-    file_dict[key] = block
-    return file_dict
-
-
-# A class should be created to hold all of the file dictionaries
-def file_walk(
-    path,
-    file_filter,
-    regex,
-    host_file={},
-    hostgroup_file={},
-    hostdependency_file={},
-    hostescalation_file={},
-    hostextinfo_file={},
-    service_file={},
-    servicegroup_file={},
-    servicedependency_file={},
-    serviceescalation_file={},
-    serviceextinfo_file={},
-    contact_file={},
-    contactgroup_file={},
-    timeperiod_file={},
-    command_file={},
-):
-    for root, _, filelist in os.walk(path):
-        for base_file_name in fnmatch.filter(filelist, file_filter):
-            base_file_name = "/".join(
-                [
-                    root,
-                    base_file_name
-                ]
-            )
-            base_file = open(base_file_name, 'r')
-            override_file_name = ".".join([base_file_name, "override"])
-            # Possible race condition with this. A try/catch block with open
-            # would be better, but I don't want to deal with that right now.
-            if os.path.isfile(override_file_name):
-                override_file = open(override_file_name, 'r')
-                base_file_parsed = parse_file(base_file, regex)
-                override_file_parsed = parse_file(override_file, regex)
-                final_file = merge_files(base_file_parsed, override_file_parsed)
-                override_file.close()
+            if config_class.common["block_end"].match(line):
+                in_block = False
+                block_num += 1
+                parsed_file = block_cleaner(block_type, parsed_file)
+                return_list.append(parsed_file)
+                parsed_file = dict()
+                parsed_file["content"] = dict()
             else:
-                final_file = parse_file(base_file, regex)
+                if verbose:
+                    print("Line: {0}".format(line))
+                logger.info("Line: {0}".format(line))
 
-            print("Final file: {0}".format(final_file))
-            base_file.close()
+                if config_class.field["template"].match(line):
+                    parsed_file["template"] = True
+                elif config_class.field["name"].match(line):
+                        parsed_file["name"] = line.strip().split().pop()
 
-            for block_num in final_file:
-                block_type = final_file[block_num]["type"]
-                print("Adding {0} file.".format(block_type))
-                if block_type == "host":
-                    host_file = set_dict_block(host_file,
-                                               base_file_name,
-                                               block_type,
-                                               block_num,
-                                               final_file[block_num])
-                elif block_type == "hostgroup":
-                    hostgroup_file = set_dict_block(hostgroup_file,
-                                                    base_file_name,
-                                                    block_type,
-                                                    block_num,
-                                                    final_file[block_num])
-                elif block_type == "hostdependency":
-                    hostdependency_file = set_dict_block(hostdependency_file,
-                                                         base_file_name,
-                                                         block_type,
-                                                         block_num,
-                                                         final_file[block_num])
-                elif block_type == "hostescalation":
-                    hostescalation_file = set_dict_block(hostescalation_file,
-                                                         base_file_name,
-                                                         block_type,
-                                                         block_num,
-                                                         final_file[block_num])
-                elif block_type == "hostextinfo":
-                    hostextinfo_file = set_dict_block(hostextinfo_file,
-                                                      base_file_name,
-                                                      block_type,
-                                                      block_num, final_file[block_num])
-                elif block_type == "service":
-                    service_file = set_dict_block(service_file,
-                                                  base_file_name,
-                                                  block_type,
-                                                  block_num,
-                                                  final_file[block_num])
-                elif block_type == "servicegroup":
-                    servicegroup_file = set_dict_block(servicegroup_file,
-                                                       base_file_name,
-                                                       block_type,
-                                                       block_num,
-                                                       final_file[block_num])
-                elif block_type == "servicedependency":
-                    servicedependency_file = set_dict_block(servicedependency_file,
-                                                            base_file_name,
-                                                            block_type,
-                                                            block_num,
-                                                            final_file[block_num])
-                elif block_type == "serviceescalation":
-                    serviceescalation_file = set_dict_block(serviceescalation_file,
-                                                            base_file_name,
-                                                            block_type,
-                                                            block_num,
-                                                            final_file[block_num])
-                elif block_type == "serviceextinfo":
-                    serviceextinfo_file = set_dict_block(serviceextinfo_file,
-                                                         base_file_name,
-                                                         block_type,
-                                                         block_num,
-                                                         final_file[block_num])
-                elif block_type == "contact":
-                    contact_file = set_dict_block(contact_file,
-                                                  base_file_name,
-                                                  block_type,
-                                                  block_num,
-                                                  final_file[block_num])
-                elif block_type == "contactgroup":
-                    contactgroup_file = set_dict_block(contactgroup_file,
-                                                       base_file_name,
-                                                       block_type,
-                                                       block_num,
-                                                       final_file[block_num])
-                elif block_type == "timeperiod":
-                    timeperiod_file = set_dict_block(timeperiod_file,
-                                                     base_file_name,
-                                                     block_type,
-                                                     block_num,
-                                                     final_file[block_num])
-                elif block_type == "command":
-                    command_file = set_dict_block(command_file,
-                                                  base_file_name,
-                                                  block_type,
-                                                  block_num,
-                                                  final_file[block_num])
+                line = entry_cleaner(config_class,
+                                     block_type,
+                                     parsed_file["template"],
+                                     line)
 
-    return host_file, hostgroup_file, hostdependency_file, \
-        hostescalation_file, hostextinfo_file, service_file, \
-        servicegroup_file, servicedependency_file, serviceescalation_file, \
-        serviceextinfo_file, contact_file, contactgroup_file, \
-        timeperiod_file, command_file
+                if line:
+                    parsed_file["content"][line[0].strip()] = line[1].strip()
+
+    return return_list
 
 
-def build_config(cfg_file, cfg_data):
-    for filename in cfg_data:
-        cfg_file.write("# Start {0}\n".format(filename))
-        cfg_file.write("define {0} {{\n".format(cfg_data[filename]["type"]))
-        for key in cfg_data[filename]["content"]:
-            cfg_file.write("    {0}    {1}\n".format(
-                key,
-                cfg_data[filename]["content"][key]
-            ))
-        cfg_file.write("}\n")
-        cfg_file.write("# End {0}\n".format(filename))
+def process_files(worklist,
+                  config_class,
+                  db_obj,
+                  verbose=False):
+    logger = logging.getLogger(__name__)
+    read_block_size = 65536
+
+    for workfile in worklist:
+        print("{0}".format(workfile))
+        logger.info("Working on file: {0}".format(workfile))
+
+        override = regex_match(config_class.override_file, workfile)
+
+        # Hashing file to get a unique way to id the file besides the name.
+        file_hash = hashlib.sha1()
+        with open(workfile, 'rb') as file_obj_bin:
+            file_read_buffer = file_obj_bin.read(read_block_size)
+            while len(file_read_buffer) > 0:
+                file_hash.update(file_read_buffer)
+                file_read_buffer = file_obj_bin.read()
+
+        with open(workfile, 'r') as file_obj:
+            parsed_file_list = parse_file(file_obj, config_class, verbose)
+            for item in parsed_file_list:
+                db_obj.metadata_insert('type', item['type'])
+                db_obj.content_insert(file_hash.hexdigest(), override, item)
+
+
+def setup_monitor(db, monitor):
+    # TODO: Create a dependency graph for each type so most of this crap is
+    # deprecated.
+    # TODO: Get a list from Monitor for each type so we can skip loading items
+    # which are already objects in Monitor.
+    print("Setting up OP5 Monitor...")
+
+    column_list = "filename, content, block_name, block_type"
+
+    # Starting adding commands
+    where_clause = " and ".join([
+        "block_type = 'command'",
+        "template = false",
+        "override = false"
+    ])
+    rows = db.content_fetch(
+        column_list,
+        where_clause
+    )
+    if len(rows) > 0:
+        monitor.post("command", rows)
+    # Ending adding commands
+
+    # Starting loading timeperiods
+    where_clause = ' and '.join([
+        "block_type = 'timeperiod'",
+        "override = false",
+        "template = true"
+    ])
+    rows = db.content_fetch(
+        column_list,
+        where_clause
+    )
+    if len(rows) > 0:
+        monitor.post("timeperiod", rows)
+
+    where_clause = ' and '.join([
+        "block_type = 'timeperiod'",
+        "override = false",
+        "template = false"
+    ])
+    rows = db.content_fetch(
+        column_list,
+        where_clause
+    )
+    if len(rows) > 0:
+        monitor.post("timeperiod", rows)
+
+    rows = db.content_fetch(
+        column_list,
+        "block_type = 'timeperiod' and override = true and template = false"
+    )
+    if len(rows) > 0:
+        monitor.post("timeperiod", rows)
+    # Ending loading timeperiods
+
+    # Starting loading contact templates
+    # Getting the generic contact since everything depends on that.
+    # TODO Fix this so "generic-contact" isn't hardcoded.
+    where_clause = " and ".join([
+        "block_type = 'contact'",
+        "template = true",
+        "override = false",
+        "content @> '{ \"name\": \"generic-contact\" }'"
+    ])
+    rows = db.content_fetch(
+        column_list,
+        where_clause
+    )
+    if len(rows) > 0:
+        monitor.save_internal = 1
+        monitor.post("contact_template", rows)
+        monitor.save_interval = 20
+
+    # Getting the rest of the contact_template entries.
+    where_clause = " and ".join([
+        "block_type = 'contact'",
+        "template = true",
+        "override = false",
+        "not content @> '{ \"name\": \"generic-contact\" }'"
+    ])
+    rows = db.content_fetch(
+        column_list,
+        where_clause
+    )
+    if len(rows) > 0:
+        monitor.post("contact_template", rows)
+
+    # Getting contact_template overrides.
+    where_clause = " and ".join([
+        "block_type = 'contact'",
+        "template = true",
+        "override = true"
+    ])
+    rows = db.content_fetch(
+        column_list,
+        where_clause
+    )
+    if len(rows) > 0:
+        monitor.post("contact_template", rows)
+
+    # Ending loading contact templates
+
+    # Starting loading contacts
+    where_clause = " and ".join([
+        "block_type = 'contact'",
+        "template = false",
+        "override = false"
+    ])
+    rows = db.content_fetch(
+        column_list,
+        where_clause
+    )
+    if len(rows) > 0:
+        monitor.post("contact", rows)
+
+    # Ending loading contacts
+
+    # Starting loading contact groups
+    where_clause = " and ".join([
+        "block_type = 'contactgroup'",
+        "content @> '{ \"contactgroup_name\": \"BlackMesh\" }'"
+    ])
+    rows = db.content_fetch(
+        column_list,
+        where_clause
+    )
+    if len(rows) > 0:
+        monitor.post("contactgroup", rows)
+
+    where_clause = " and ".join([
+        "block_type = 'contactgroup'",
+        "not content @> '{ \"contactgroup_name\": \"BlackMesh\" }'"
+    ])
+    rows = db.content_fetch(
+        column_list,
+        where_clause
+    )
+    if len(rows) > 0:
+        monitor.post("contactgroup", rows)
+
+    # Ending loading contact groups
+
+    # Starting loading host templates
+    where_clause = " and ".join([
+        "block_type = 'host'",
+        "template = true",
+        "override = false",
+        "content @> '{ \"name\": \"generic-host\" }'"
+    ])
+    rows = db.content_fetch(
+        column_list,
+        where_clause
+    )
+    if len(rows) > 0:
+        monitor.save_interval = 1
+        monitor.post("host_template", rows)
+        monitor.save_interval = 20
+
+    where_clause = " and ".join([
+        "block_type = 'host'",
+        "template = true",
+        "override = false",
+        "not content @> '{ \"name\": \"generic-host\" }'"
+    ])
+    rows = db.content_fetch(
+        column_list,
+        where_clause,
+    )
+    if len(rows) > 0:
+        monitor.post("host_template", rows)
+
+    # Ending loading host templates
+
+    # Starting loading hostgroups templates
+    where_clause = " and ".join([
+        "block_type = 'hostgroup'",
+        "template = true",
+        "override = false",
+    ])
+    rows = db.content_fetch(
+        column_list,
+        where_clause
+    )
+    if len(rows) > 0:
+        print("Adding hostgroup.")
+        monitor.post("hostgroup", rows)
+
+    # Ending loading hostgroups templates
+
+    # Starting loading hostgroups without members
+    where_clause = " and ".join([
+        "block_type = 'hostgroup'",
+        "template = false",
+        "override = false",
+        "not content ? 'members'"
+    ])
+    rows = db.content_fetch(
+        column_list,
+        where_clause
+    )
+    if len(rows) > 0:
+        print("Adding hostgroup.")
+        monitor.post("hostgroup", rows)
+
+    # Ending loading hostgroups without members
+
+    # Starting loading hosts
+    # Parents first
+    where_clause = " and ".join([
+        "block_type = 'host'",
+        "template = false",
+        "override = false",
+        "not content ? 'parents'"
+    ])
+    rows = db.content_fetch(
+        column_list,
+        where_clause
+    )
+    if len(rows) > 0:
+        print("Adding host")
+        monitor.post("host", rows)
+
+    # Now children
+    where_clause = " and ".join([
+        "block_type = 'host'",
+        "template = false",
+        "override = false",
+        "content ? 'parents'"
+    ])
+    rows = db.content_fetch(
+        column_list,
+        where_clause
+    )
+    # Looping through the hosts multiple times because my code to sort this out
+    # is wonky, and I needed an immediate fix.
+    if len(rows) > 0:
+        print("Adding host 1st loop")
+        monitor.post("host", rows)
+
+    if len(rows) > 0:
+        print("Adding host 2nd loop")
+        monitor.post("host", rows)
+
+    if len(rows) > 0:
+        print("Adding host 3rd loop")
+        monitor.post("host", rows)
+
+    if len(rows) > 0:
+        print("Adding host 4th loop")
+        monitor.post("host", rows)
+
+    # Ending loading hosts
+
+    # Starting loading hostgroups with members
+    where_clause = " and ".join([
+        "block_type = 'hostgroup'",
+        "template = false",
+        "override = false",
+        "content ? 'members'"
+    ])
+    rows = db.content_fetch(
+        column_list,
+        where_clause
+    )
+    if len(rows) > 0:
+        print("Adding hostgroup.")
+        monitor.post("hostgroup", rows)
+
+    # Ending loading hostgroups with members
+
+    # Starting loading base service template
+    where_clause = " and ".join([
+        "block_type = 'service'",
+        "template = true",
+        "override = false",
+        "not content ? 'template'"
+    ])
+    rows = db.content_fetch(
+        column_list,
+        where_clause
+    )
+    if len(rows) > 0:
+        print ("Adding service")
+        monitor.post("service_template", rows)
+
+    # Ending loading base service templates
+
+    # Start loading servicegroup
+    where_clause = " and ".join([
+        "block_type = 'servicegroup'",
+    ])
+    rows = db.content_fetch(
+        column_list,
+        where_clause
+    )
+    if len(rows) > 0:
+        print("Adding servicegroup")
+        monitor.post("servicegroup", rows)
+    # Ending loading servicegroups
+
+    # Starting loading service templates
+    where_clause = " and ".join([
+        "block_type = 'service'",
+        "content @> '{ \"name\": \"remote-service\"}'"
+    ])
+    rows = db.content_fetch(
+        column_list,
+        where_clause
+    )
+    if len(rows) > 0:
+        print ("Adding service")
+        monitor.post("service_template", rows)
+
+    # Ending loading service templates
+
+    # Starting loading service templates with servicegroup
+    where_clause = " and ".join([
+        "block_type = 'service'",
+        "template = true",
+        "content ? 'servicegroups'"
+    ])
+    rows = db.content_fetch(
+        column_list,
+        where_clause,
+    )
+    if len(rows) > 0:
+        print("Adding service template with servicegroup dependencies")
+        monitor.post("service_template", rows)
+
+    # Ending loading service templates with servicegroup
+
+    # Starting loading service templates without servicegroup
+    where_clause = " and ".join([
+        "block_type = 'service'",
+        "template = true",
+        "not content ? 'servicegroups'"
+    ])
+    rows = db.content_fetch(
+        column_list,
+        where_clause,
+    )
+    if len(rows) > 0:
+        print("Adding service template without servicegroup dependencies")
+        monitor.post("service_template", rows)
+    # Ending loading service templates without servicegroup
+
+    # Starting loading services
+    where_clause = " and ".join([
+        "block_type = 'service'",
+        "template = false",
+        "override = false",
+    ])
+    rows = db.content_fetch(
+        column_list,
+        where_clause
+    )
+    if len(rows) > 0:
+        print("Adding service")
+        monitor.post("service", rows)
+
+    # Ending loading services
 
 
 def main():
@@ -291,6 +1026,7 @@ def main():
             '%(message)s'
         ]
     )
+
     logging.basicConfig(
         format=log_entry_format,
         level=logging.INFO,
@@ -300,248 +1036,177 @@ def main():
 
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument(
+        "config",
+        help="YAML formatted configuration file."
+    )
+    parser.add_argument(
+        "url",
+        help="OP5 Monitor server URL."
+    )
+    parser.add_argument(
+        "account",
+        help="OP5 Monitor account."
+    )
+    parser.add_argument(
+        "password",
+        help="OP5 Monitor account password."
+    )
+    parser.add_argument(
         "path",
         nargs='+',
-        help="List of paths to search."
+        help="Space separated list of paths to search."
     )
     parser.add_argument(
-        "-f",
-        "--filter",
-        dest='file_filter',
-        default='*.cfg',
-        help="Set the search filter for files, default \"*\"."
-    )
-    parser.add_argument(
-        "-a",
-        "--append",
-        default=False,
+        "-v",
+        "--verbose",
         action='store_true',
-        help="Appends the files rather then overwriting."
+        help="Enable more output."
     )
     parser.add_argument(
-        "-d",
-        "--db-dest",
-        help="Sets the location of the json db file."
+        "--nossl",
+        action='store_true',
+        help="Disable SSL checks."
     )
     parser.add_argument(
-        "-A",
-        "--host-file",
-        dest='host_file',
-        default='hosts.cfg',
-        help="Changes the hosts config file."
+        "--nop",
+        action='store_true',
+        help="Dry run, no operations are executed."
     )
     parser.add_argument(
-        "-B",
-        "--hostgroup-file",
-        dest='hostgroup_file',
-        default='hostgroups.cfg',
-        help="Changes the hostgroups config file."
+        "--pop",
+        action='store_true',
+        help="Partial operations, don't save anything."
     )
     parser.add_argument(
-        "-C",
-        "--hostdependency-file",
-        dest='hostdependency_file',
-        default='hostdependencies.cfg',
-        help="Changes the hostdependencies config file."
+        "-i",
+        "--save-interval",
+        type=int,
+        default=20,
+        dest="save_interval",
+        help="Sets the interval between saves."
     )
     parser.add_argument(
-        "-D",
-        "--hostescalation-file",
-        dest='hostescalation_file',
-        default='hostescalations.cfg',
-        help="Changes the hostescalations config file."
-    )
-    parser.add_argument(
-        "-E",
-        "--hostextinfo-file",
-        dest='hostextinfo_file',
-        default='hostextinfo.cfg',
-        help="Changes the hostextinfo config file."
-    )
-    parser.add_argument(
-        "-F",
-        "--service-file",
-        dest='service_file',
-        default='services.cfg',
-        help="Changes the services config file."
-    )
-    parser.add_argument(
-        "-G",
-        "--servicegroup-file",
-        dest='servicegroup_file',
-        default='servicegroups.cfg',
-        help="Changes the servicegroups config file."
-    )
-    parser.add_argument(
-        "-H",
-        "--servicedependency-file",
-        dest='servicedependency_file',
-        default='servicedependencies.cfg',
-        help="Changes the servicedependencies config file."
-    )
-    parser.add_argument(
-        "-I",
-        "--serviceescalation-file",
-        dest='serviceescalation_file',
-        default='serviceescalations.cfg',
-        help="Changes the serviceescalations config file."
-    )
-    parser.add_argument(
-        "-J",
-        "--serviceextinfo-file",
-        dest='serviceextinfo_file',
-        default='serviceextinfo.cfg',
-        help="Changes the serviceextinfs config file."
-    )
-    parser.add_argument(
-        "-K",
-        "--contact-file",
-        dest='contact_file',
-        default='contacts.cfg',
-        help="Changes the contacts config file."
-    )
-    parser.add_argument(
-        "-L",
-        "--contactgroup-file",
-        dest='contactgroup_file',
-        default='contactgroups.cfg',
-        help="Changes the contactgroups config file."
-    )
-    parser.add_argument(
-        "-M",
-        "--timeperiod-file",
-        dest='timeperiod_file',
-        default='timeperiods.cfg',
-        help="Changes the timeperiods config file."
-    )
-    parser.add_argument(
-        "-N",
-        "--command-file",
-        dest='command_file',
-        default='commands.cfg',
-        help="Changes the commands config file."
+        "-s",
+        "--skip-load",
+        dest='skip_load',
+        action="store_true",
+        help="Skips loading the files into the database. Database needs to populated for this to work."
     )
     args = parser.parse_args()
 
-    file_filter = args.file_filter
-    host_file_name = args.host_file
-    hostgroup_file_name = args.hostgroup_file
-    hostdependency_file_name = args.hostdependency_file
-    hostescalation_file_name = args.hostescalation_file
-    hostextinfo_file_name = args.hostextinfo_file
-    service_file_name = args.service_file
-    servicegroup_file_name = args.servicegroup_file
-    servicedependency_file_name = args.servicedependency_file
-    serviceescalation_file_name = args.serviceescalation_file
-    serviceextinfo_file_name = args.serviceextinfo_file
-    contact_file_name = args.contact_file
-    contactgroup_file_name = args.contactgroup_file
-    timeperiod_file_name = args.timeperiod_file
-    command_file_name = args.command_file
-    if (args.append):
-        open_mode = 'a'
-    else:
-        open_mode = 'w'
+    op5monitor = OP5MonitorHTTP(
+        args.url,
+        args.account,
+        args.password,
+        args.save_interval
+    )
 
-    # TODO: Move this into a yaml file to allow for custom configurations.
-    # Keep some defaults like blankline and comment.
-    regex_dict = {
-        "host": re.compile("^define host( |){"),
-        "hostgroup": re.compile("^define hostgroup( |){"),
-        "hostdependency": re.compile("^define hostdependency( |){"),
-        "hostescalation": re.compile("^define hostescalation( |){"),
-        "hostextinfo": re.compile("^define hostextinfo( |){"),
-        "service": re.compile("^define service( |){"),
-        "servicegroup": re.compile("^define servicegroup( |){"),
-        "servicedependency": re.compile("^define servicedependency( |){"),
-        "serviceescalation": re.compile("^define serviceescalation( |){"),
-        "serviceextinfo": re.compile("^define serviceextinfo( |){"),
-        "contact": re.compile("^define contact( |){"),
-        "contactgroup": re.compile("^define contactgroup( |){"),
-        "timeperiod": re.compile("^define timeperiod( |){"),
-        "command": re.compile("^define command( |){"),
-        "end": re.compile("^}$"),
-        "comment": re.compile("^#"),
-        "blankline": re.compile("^\s*$"),
-    }
+    if args.nossl:
+        op5monitor.disable_ssl()
 
-    logger.info("Starting consolidation work.")
+    if args.nop:
+        op5monitor.set_no_op()
+    elif args.pop:
+        op5monitor.set_part_op()
+
+    config = ConfigParser.ConfigParser()
+    config.read(args.config)
+
+    ignore_dirs = config.get("ignore", "dirs")
+    ignore_files = config.get("ignore", "files")
+    include_file_ext_regex = ast.literal_eval(config.get("include",
+                                                         "file_ext"))
+    config_class = ConfigFileObj(config)
+    config_class.print_common(verbose=args.verbose)
+    config_class.print_block(verbose=args.verbose)
+    config_class.print_fields(verbose=args.verbose)
+
+    db_account = config.get("database", "account")
+    db_password = config.get("database", "password")
+    db_database = config.get("database", "database")
+    db_host = config.get("database", "host")
+
+    file_regex = list()
+    file_work_list = list()
+    # The length of the list changes as we delete items, so we have to delete
+    # items in descending order to make sure the index number is correct and
+    # valid. We're going to capture the index of items to delete here.
+    index_list = list()
+
+    for regex in include_file_ext_regex:
+        file_regex.append(re.compile(regex))
+
+    print("Starting work.")
+    logging.info("Starting consolidation work.")
 
     for path in args.path:
-        host_file_dict, \
-            hostgroup_file_dict, \
-            hostdependency_file_dict, \
-            hostescalation_file_dict, \
-            hostextinfo_file_dict, \
-            service_file_dict, \
-            servicegroup_file_dict, \
-            servicedependency_file_dict, \
-            serviceescalation_file_dict, \
-            serviceextinfo_file_dict, \
-            contact_file_dict, \
-            contactgroup_file_dict, \
-            timeperiod_file_dict, \
-            command_file_dict \
-            = file_walk(path, file_filter, regex_dict)
+        for root, dirlist, filelist in os.walk(path):
+            logging.info("Root dir: {0}".format(root))
+            for del_dir in ignore_dirs:
+                if del_dir in dirlist:
+                    idx = dirlist.index(del_dir)
+                    if idx not in index_list:
+                        logging.info("Ignoring dir: {0}".format(dirlist[idx]))
+                        index_list.append(idx)
 
-    # TODO: Turn this into a loop
-    host_file_handler = open(host_file_name, open_mode)
-    build_config(host_file_handler, host_file_dict)
-    host_file_handler.close()
+            # Sorting to make sure the list is in ascending order before we
+            # start popping items off the end.
+            index_list.sort()
+            while index_list != []:
+                del dirlist[index_list.pop()]
 
-    hostgroup_file_handler = open(hostgroup_file_name, open_mode)
-    build_config(hostgroup_file_handler, hostgroup_file_dict)
-    hostgroup_file_handler.close()
+            for del_file in ignore_files:
+                if del_file in filelist:
+                    idx = filelist.index(del_file)
+                    if idx not in index_list:
+                        logging.info("Ignoring file: {0}".format(
+                            filelist[idx])
+                        )
+                        index_list.append(idx)
 
-    hostdependency_file_handler = open(hostdependency_file_name, open_mode)
-    build_config(hostdependency_file_handler, hostdependency_file_dict)
-    hostdependency_file_handler.close()
+            for file_name in filelist:
+                for ext_regex in file_regex:
+                    if not regex_match(ext_regex, file_name):
+                        idx = filelist.index(file_name)
+                        if idx not in index_list:
+                            logging.info("Ignoring file: {0}".format(
+                                filelist[idx]))
+                            index_list.append(idx)
+                    else:
+                        break
 
-    hostescalation_file_handler = open(hostescalation_file_name, open_mode)
-    build_config(hostescalation_file_handler, hostescalation_file_dict)
-    hostescalation_file_handler.close()
+            index_list.sort()
+            while index_list != []:
+                idx = index_list.pop()
+                del filelist[idx]
 
-    hostextinfo_file_handler = open(hostextinfo_file_name, open_mode)
-    build_config(hostextinfo_file_handler, hostextinfo_file_dict)
-    hostextinfo_file_handler.close()
+            logging.info("File work list: {0}".format("; ".join(filelist)))
 
-    service_file_handler = open(service_file_name, open_mode)
-    build_config(service_file_handler, service_file_dict)
-    service_file_handler.close()
+            for filename in filelist:
+                file_full_name = "/".join([root, filename])
+                file_work_list.append(file_full_name)
 
-    servicegroup_file_handler = open(servicegroup_file_name, open_mode)
-    build_config(servicegroup_file_handler, servicegroup_file_dict)
-    servicegroup_file_handler.close()
+    db_obj = OP5DatabaseClass(
+        db_account,
+        db_password,
+        db_database,
+        db_host
+    )
+    if not args.skip_load:
+        process_files(file_work_list, config_class, db_obj)
+    else:
+        logging.info("Skipping file loading. Database already populated... hopefully.")
+        print("Skipping file loading. Database already populated... hopefully.")
 
-    servicedependency_file_handler = open(servicedependency_file_name,
-                                          open_mode)
-    build_config(servicedependency_file_handler, servicedependency_file_dict)
-    servicedependency_file_handler.close()
+    if not args.nop:
+        setup_monitor(db_obj, op5monitor)
+    else:
+        print("No op set. Skipping loading into OP5 Monitor.")
 
-    serviceescalation_file_handler = open(serviceescalation_file_name,
-                                          open_mode)
-    build_config(serviceescalation_file_handler, serviceescalation_file_dict)
-    serviceescalation_file_handler.close()
+    db_obj.close()
 
-    serviceextinfo_file_handler = open(serviceextinfo_file_name, open_mode)
-    build_config(serviceextinfo_file_handler, serviceextinfo_file_dict)
-    serviceextinfo_file_handler.close()
-
-    contact_file_handler = open(contact_file_name, open_mode)
-    build_config(contact_file_handler, contact_file_dict)
-    contact_file_handler.close()
-
-    contactgroup_file_handler = open(contactgroup_file_name, open_mode)
-    build_config(contactgroup_file_handler, contactgroup_file_dict)
-    contactgroup_file_handler.close()
-
-    timeperiod_file_handler = open(timeperiod_file_name, open_mode)
-    build_config(timeperiod_file_handler, timeperiod_file_dict)
-    timeperiod_file_handler.close()
-
-    command_file_handler = open(command_file_name, open_mode)
-    build_config(command_file_handler, command_file_dict)
-    command_file_handler.close()
+    print("Ending work.")
+    logging.info("Ending consolidation work.")
 
     return 0
 
