@@ -528,9 +528,7 @@ def block_cleaner(block_type, parsed_block):
            and "service_description" in parsed_block["content"] \
            and "name" in parsed_block["content"]:
             parsed_block["content"]["display_name"] = \
-                          parsed_block["content"].pop("service_description")
-            parsed_block["content"]["service_description"] = \
-                                         parsed_block["content"].pop("name")
+                          parsed_block["content"].pop("name")
         elif "name" in parsed_block["content"] \
              and "service_description" not in parsed_block["content"] \
              and parsed_block["template"] == False:
