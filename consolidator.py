@@ -488,6 +488,11 @@ def block_cleaner(block_type, parsed_block):
             parsed_block["content"]["contact_groups"] = \
                         parsed_block["content"]["contact_groups"].split(",")
 
+        if "contacts" in parsed_block["content"]:
+            if "," in parsed_block["content"]["contacts"]:
+                parsed_block["content"]["contacts"] = \
+                                parsed_block["content"]["contacts"].split(",")
+
         if "hostgroups" in parsed_block["content"]:
             parsed_block["content"]["hostgroups"] = \
                             parsed_block["content"]["hostgroups"].split(",")
