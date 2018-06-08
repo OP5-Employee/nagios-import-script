@@ -466,6 +466,14 @@ def block_cleaner(block_type, parsed_block):
             parsed_block["content"]["alias"] = \
                                         parsed_block["content"]["contact_name"]
 
+        if "contactgroups" in parsed_block["content"]:
+            if "," in parsed_block["content"]["contactgroups"]:
+                parsed_block["content"]["contactgroups"] = \
+                            parsed_block["content"]["contactgroups"].split(",")
+
+            if parsed_block["content"]["contactgroups"] is "null":
+                parsed_block["content"].pop("contactgroups")
+
     elif block_type == "contactgroup":
         # TODO Change this part to a regex function.
         # Making sure the members are a ", " separated list as the API
@@ -506,6 +514,10 @@ def block_cleaner(block_type, parsed_block):
            and "alias" in parsed_block["content"]:
             parsed_block["content"]["hostgroup_name"] = \
                   parsed_block["content"]["alias"].lower().replace(" ", "-")
+
+        if "hostgroup_members" in parsed_block["content"]:
+            parsed_block["content"]["hostgroup_members"] = \
+                        parsed_block["content"]["hostgroup_members"].split(",")
 
     elif block_type == "service":
         if "contact_groups" in parsed_block["content"]:
