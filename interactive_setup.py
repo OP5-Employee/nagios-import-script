@@ -48,5 +48,5 @@ def cursor_row_count(cursor):
 
 account = 'consolidator'
 password = 'dbpass'
-hostname = 'jackalope.home.dangertoaster.com'
+hostname = 'postgresql.server.domain.tld'
 database = 'consolidationdb'

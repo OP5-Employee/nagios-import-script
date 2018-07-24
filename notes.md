@@ -24,7 +24,7 @@ StdLib:
 
 ### PostgreSQL Setup
 
-References: 
+References:
 - https://wiki.postgresql.org/wiki/YUM\_Installation
 - https://www.postgresql.org/docs/current/static/app-createdb.html
 - https://www.postgresql.org/docs/current/static/app-createuser.html
@@ -66,15 +66,14 @@ psql -h localhost -U <accountname> -d <accountdb>
 
 ## Running Db Based Import
 
-1. Run `filewalk.py` pointing to the config file, OP5 Monitor install, and OP5 Monitor account credentials.
+1. Run `consolidator.py` pointing to the config file, OP5 Monitor install, and OP5 Monitor account credentials.
 
 ## Project file description
 
 - `notes.md`: Readme and other random notes.
 - `consolidator.conf`: Ini style config file which can be used to the ConfigParser module.
 - `createdb.py`: Script to setup the PostgreSQL database.
-- `filewalk.py`: PostgreSQL backed nagios importer.
-- `consolidator.py`: Deprecated config file creator.
+- `consolidator.py`: PostgreSQL backed nagios importer.
 - `interactive_setup.py`: Script to setup an interactive shell for testing. ex: `bpython -i interactive_setup.py`
 - `file_cleaner.py`: Script to test block parsing.
 - `db_query.py`: Script to setup an interactive shell for db testing or a standalone script to test db queries.
@@ -208,3 +207,6 @@ cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 ```
 
 ## Bugs
+
+The Nagios parsing logic still needs to be beat on. There are probably going to be bugs.
+
