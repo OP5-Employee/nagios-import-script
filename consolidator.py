@@ -23,8 +23,14 @@ class OP5MonitorHTTP:
     nop = False
     pop = False
     save_check = 0
+    verbose = False
 
-    def __init__(self, server_url, account, password, save_interval):
+    def __init__(self,
+                 server_url,
+                 account,
+                 password,
+                 save_interval,
+                 skip_updates):
         #self.__class__.logger = logging.getLogger(self.class.__class__.__name__)
         self.url = "/".join(
             [
@@ -35,6 +41,7 @@ class OP5MonitorHTTP:
         )
         self.auth_pair = (account, password)
         self.save_interval = save_interval
+        self.skip_updates = skip_updates
 
     def disable_ssl(self):
         print("Supressing SSL warnings...")
@@ -100,7 +107,7 @@ class OP5MonitorHTTP:
                 data=json.dumps({})
             )
 
-            sleep(3)
+            sleep(2)
 
 
         if http_save.status_code != 200 \
@@ -140,8 +147,8 @@ class OP5MonitorHTTP:
             print("No op specified. Not overwriting.")
             return 0
 
-        print ("Putting object and overwriting...")
         server_target = self.build_target(endpoint, endpoint_obj)
+        print ("Putting object and overwriting... {0}".format(server_target))
 
         for datapayload in datalist:
             http_put = requests.put(
@@ -155,10 +162,12 @@ class OP5MonitorHTTP:
 
             self.check_status_code(http_put, datapayload)
             self.check_save_interval()
+        
+        self.save()
 
         return http_put.status_code
 
-    def post(self, endpoint, datalist, update_on_duplicate=False):
+    def post(self, endpoint, datalist):
         if self.nop:
             print("No op specified. Not posting.")
             return 0
@@ -177,10 +186,11 @@ class OP5MonitorHTTP:
             )
 
             if http_post.status_code == 409 \
-               and update_on_duplicate == True:
+               and self.skip_updates == False:
                 self.put(endpoint, datapayload["block_name"], [datapayload])
-            elif http_post.status_code == 409:
-                print("409 code")
+            elif http_post.status_code == 409 \
+               and self.verbose == False:
+                continue
             else:
                 self.check_status_code(http_post, datapayload)
 
@@ -223,6 +233,7 @@ class ConfigFileObj:
     field = dict()
     replacements = dict()
     override_file = None
+    verbose = False
 
     def __init__(self, config):
         self.override_file = re.compile(
@@ -297,6 +308,16 @@ class ConfigFileObj:
             self.replacements[search_type][cfgpair[0]] = re.compile(
                 ast.literal_eval(cfgpair[1])
             )
+
+        if self.verbose:
+            print("Common Regex:")
+        for pair in self.common.items():
+            key, val = pair
+            if self.verbose:
+                print("{0}\t{1}".format(key, val.pattern))
+            self.logger.info("Common Regex Pattern: {0}\t{1}".format(
+                key, val.pattern
+            ))
 
     def print_common(self, verbose=True):
         logger = logging.getLogger(__name__)
@@ -384,7 +405,11 @@ class OP5DatabaseClass:
                        content
                     )
         VALUES(%s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT DO NOTHING;
+        ON CONFLICT ON CONSTRAINT content_pkey DO UPDATE
+            SET block_name = EXCLUDED.block_name,
+                override = EXCLUDED.override,
+                template = EXCLUDED.template,
+                content = EXCLUDED.content;
         """
 
         cursor = self.connection.cursor()
@@ -444,12 +469,59 @@ def entry_cleaner(config_class, block_type, template, line):
     elif block_type == 'service':
         if config_class.replacements['common']['template'].match(line):
             line = line.replace('use', 'template')
+        elif config_class.replacements['common']['checkinterval'].match(line):
+            line = line.replace('normal_check_interval', 'check_interval')
+        elif config_class.replacements['common']['obsess'].match(line):
+            line = line.replace('obsess_over_service', 'obsess')
+        elif config_class.replacements['common']['retryinterval'].match(line):
+            line = line.replace('retry_check_interval', 'retry_interval')
+        elif config_class.replacements['service']['displayname'].match(line):
+            line = line.replace('description', 'display_name')
 
     # Breaking the line up into fields for JSON key/value pairs.
     if line:
-        if block_type == 'timeperiod' \
-           and not config_class.replacements['timeperiod']['nottimerange'].match(line):
-            line = line.rsplit( ' ', 1)
+        if block_type == 'timeperiod':
+            if config_class.replacements['timeperiod']['nottimerange'].match(line):
+                line = line.split(' ', 1)
+            elif config_class.replacements['timeperiod']['weekday'].match(line):
+                day, times = line.rsplit(" ", 1)
+
+                if ',' in times:
+                    time_list = []
+                    times = times.split(',')
+                    for entry in times:
+                        start, end = entry.split('-')
+                        if start > end:
+                            hour, minute = end.split(":")
+                            hour = 12 + int(hour)
+                            if hour > 24:
+                                hour = "24"
+                            elif hour < 12:
+                                hour = ''.join(["0", str(hour)])
+                            else:
+                                hour = str(hour)
+                            end = ':'.join([hour, minute])
+                        entry = '-'.join([start, end])
+                        time_list.append(entry)
+                    times = ','.join(time_list)
+                else:
+                    start, end = times.split('-')
+                    if start > end:
+                        hour, minute = end.split(":")
+                        hour = 12 + int(hour)
+                        if hour > 24:
+                            hour = "24"
+                        elif hour < 12:
+                            hour = ''.join(["0", str(hour)])
+                        else:
+                            hour = str(hour)
+                        end = ':'.join([hour, minute])
+                    times = '-'.join([start, end])
+
+                line = [day, times]
+
+            else:
+                line = line.rsplit(' ', 1)
         else:
             line = line.split(' ', 1)
 
@@ -460,6 +532,16 @@ def entry_cleaner(config_class, block_type, template, line):
 
 
 def block_cleaner(block_type, parsed_block):
+    if block_type == "command":
+        parsed_block["content"]["command_name"] = "_".join([
+            "nagios", parsed_block["content"]["command_name"]
+            ])
+
+    if "check_command" in parsed_block["content"]:
+        parsed_block["content"]["check_command"] = "_".join([
+            "nagios", parsed_block["content"]["check_command"]
+        ])
+
     if block_type == "contact":
         if "alias" not in parsed_block["content"] \
            and parsed_block["template"] == False:
@@ -473,6 +555,18 @@ def block_cleaner(block_type, parsed_block):
 
             if parsed_block["content"]["contactgroups"] is "null":
                 parsed_block["content"].pop("contactgroups")
+
+        if 'service_notification_cmds' in parsed_block["content"]:
+            parsed_block["content"]["service_notification_cmds"] = '_'.join([
+                "nagios",
+                parsed_block["content"]["service_notification_cmds"]
+            ])
+
+        if 'host_notification_cmds' in parsed_block["content"]:
+            parsed_block["content"]["host_notification_cmds"] = '_'.join([
+                "nagios",
+                parsed_block["content"]["host_notification_cmds"]
+            ])
 
     elif block_type == "contactgroup":
         # TODO Change this part to a regex function.
@@ -534,16 +628,30 @@ def block_cleaner(block_type, parsed_block):
              and parsed_block["template"] == False:
             parsed_block["content"]["service_description"] = \
                                          parsed_block["content"].pop("name")
-
-        if "service_description" not in parsed_block["content"] \
+        elif "service_description" not in parsed_block["content"] \
+           and parsed_block["template"] == False \
+           and "display_name" in parsed_block["content"]:
+            parsed_block["content"]["service_description"] = \
+                    parsed_block["content"]["display_name"]
+        elif "service_description" not in parsed_block["content"] \
            and parsed_block["template"] == False:
             parsed_block["content"]["service_description"] = \
-                                        parsed_block["content"]["host_name"]
+                    parsed_block["content"]["template"]
 
         if parsed_block["template"] == True \
+           and "service_description" in parsed_block["content"] \
+           and "name" not in parsed_block["content"]:
+            tmp_var = parsed_block["content"].pop("service_description")
+            parsed_block["content"]["display_name"] = tmp_var
+            parsed_block["content"]["name"] = tmp_var
+        elif parsed_block["template"] == True \
            and "service_description" in parsed_block["content"]:
             parsed_block["content"]["display_name"] = \
-                          parsed_block["content"].pop("service_description")
+                    parsed_block["content"].pop("service_description")
+
+        if parsed_block["template"] == True \
+            and 'failure_prediction_enabled' in parsed_block["content"]:
+             del parsed_block["content"]["failure_prediction_enabled"]
 
         if "check_command" in parsed_block["content"] \
            and '!' in parsed_block["content"]["check_command"]:
@@ -562,6 +670,25 @@ def block_cleaner(block_type, parsed_block):
            and parsed_block["template"] == False:
             parsed_block["content"]["contact_groups"] = \
                         parsed_block["content"]["contact_groups"].split(",")
+
+    elif block_type == "timeperiod":
+        if "name" in parsed_block["content"]:
+            del parsed_block["content"]["name"]
+
+        if "alias" not in parsed_block["content"]:
+            parsed_block["content"]["alias"] = \
+                    parsed_block["content"]["timeperiod_name"]
+
+        if "use" in parsed_block["content"]:
+            if parsed_block["content"]["use"] == "24x7":
+                del parsed_block["content"]["use"]
+                parsed_block["content"]["monday"] = "00:00-24:00"
+                parsed_block["content"]["tuesday"] = "00:00-24:00"
+                parsed_block["content"]["wednesday"] = "00:00-24:00"
+                parsed_block["content"]["thursday"] = "00:00-24:00"
+                parsed_block["content"]["friday"] = "00:00-24:00"
+                parsed_block["content"]["saturday"] = "00:00-24:00"
+                parsed_block["content"]["sunday"] = "00:00-24:00"
 
     return parsed_block
 
@@ -626,6 +753,12 @@ def parse_file(file_obj, config_class, verbose=False):
                 if config_class.field["template"].match(line):
                     parsed_file["template"] = True
                 elif config_class.field["name"].match(line):
+                    if parsed_file["type"] == "command":
+                        parsed_file["name"] = "_".join([
+                            "nagios",
+                            line.strip().split().pop()
+                        ])
+                    else:
                         parsed_file["name"] = line.strip().split().pop()
 
                 line = entry_cleaner(config_class,
@@ -647,7 +780,8 @@ def process_files(worklist,
     read_block_size = 65536
 
     for workfile in worklist:
-        print("{0}".format(workfile))
+        if verbose:
+            print("{0}".format(workfile))
         logger.info("Working on file: {0}".format(workfile))
 
         override = regex_match(config_class.override_file, workfile)
@@ -672,6 +806,7 @@ def setup_monitor(db, monitor):
     # deprecated.
     # TODO: Get a list from Monitor for each type so we can skip loading items
     # which are already objects in Monitor.
+    logging.info("Setting up OP5 Monitor...")
     print("Setting up OP5 Monitor...")
 
     column_list = "filename, content, block_name, block_type"
@@ -966,6 +1101,18 @@ def setup_monitor(db, monitor):
     if len(rows) > 0:
         print("Adding servicegroup")
         monitor.post("servicegroup", rows)
+
+    if len(rows) > 0:
+        print("Adding servicegroup")
+        monitor.post("servicegroup", rows)
+
+    if len(rows) > 0:
+        print("Adding servicegroup")
+        monitor.post("servicegroup", rows)
+
+    if len(rows) > 0:
+        print("Adding servicegroup")
+        monitor.post("servicegroup", rows)
     # Ending loading servicegroups
 
     # Starting loading service templates
@@ -981,6 +1128,17 @@ def setup_monitor(db, monitor):
         print ("Adding service")
         monitor.post("service_template", rows)
 
+    if len(rows) > 0:
+        print ("Adding service")
+        monitor.post("service_template", rows)
+
+    if len(rows) > 0:
+        print ("Adding service")
+        monitor.post("service_template", rows)
+
+    if len(rows) > 0:
+        print ("Adding service")
+        monitor.post("service_template", rows)
     # Ending loading service templates
 
     # Starting loading service templates with servicegroup
@@ -997,6 +1155,17 @@ def setup_monitor(db, monitor):
         print("Adding service template with servicegroup dependencies")
         monitor.post("service_template", rows)
 
+    if len(rows) > 0:
+        print("Adding service template with servicegroup dependencies")
+        monitor.post("service_template", rows)
+
+    if len(rows) > 0:
+        print("Adding service template with servicegroup dependencies")
+        monitor.post("service_template", rows)
+
+    if len(rows) > 0:
+        print("Adding service template with servicegroup dependencies")
+        monitor.post("service_template", rows)
     # Ending loading service templates with servicegroup
 
     # Starting loading service templates without servicegroup
@@ -1009,6 +1178,18 @@ def setup_monitor(db, monitor):
         column_list,
         where_clause,
     )
+    if len(rows) > 0:
+        print("Adding service template without servicegroup dependencies")
+        monitor.post("service_template", rows)
+
+    if len(rows) > 0:
+        print("Adding service template without servicegroup dependencies")
+        monitor.post("service_template", rows)
+
+    if len(rows) > 0:
+        print("Adding service template without servicegroup dependencies")
+        monitor.post("service_template", rows)
+
     if len(rows) > 0:
         print("Adding service template without servicegroup dependencies")
         monitor.post("service_template", rows)
@@ -1107,13 +1288,20 @@ def main():
         action="store_true",
         help="Skips loading the files into the database. Database needs to populated for this to work."
     )
+    parser.add_argument(
+            "--skip-update",
+            dest='skip_update',
+            action="store_true",
+            help="Skips updating existing object."
+    )
     args = parser.parse_args()
 
     op5monitor = OP5MonitorHTTP(
         args.url,
         args.account,
         args.password,
-        args.save_interval
+        args.save_interval,
+        args.skip_update
     )
 
     if args.nossl:
